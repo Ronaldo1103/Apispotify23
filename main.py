@@ -8,7 +8,6 @@ app = FastAPI(title="Spotify Public API", version="1.1.0")
 PIPED_API_HOSTS = [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.leptons.xyz",
-    "https://pipedapi.nosebs.ru",
 ]
 PIPED_BASE_URL = PIPED_API_HOSTS[0]
 
@@ -61,6 +60,57 @@ def _item_data(item: Any) -> dict[str, Any]:
     if "data" in item and isinstance(item["data"], dict):
         return item["data"]
     return item
+
+
+def _itunes_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
+    try:
+        response = requests.get(
+            "https://itunes.apple.com/search",
+            params={"term": query, "entity": "song", "limit": limit},
+            timeout=15,
+        )
+        if not response.ok:
+            return []
+        payload = response.json()
+        results = payload.get("results", []) if isinstance(payload, dict) else []
+        if not isinstance(results, list):
+            return []
+
+        tracks: list[dict[str, Any]] = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            audio_url = item.get("previewUrl") or item.get("preview_url") or ""
+            if not audio_url:
+                continue
+            tracks.append({
+                "name": item.get("trackName") or item.get("name") or "Sin título",
+                "id": str(item.get("trackId") or item.get("id") or ""),
+                "uri": item.get("trackViewUrl") or item.get("collectionViewUrl") or "",
+                "type": "track",
+                "playability": "PLAYABLE",
+                "duration_ms": item.get("trackTimeMillis"),
+                "track_number": item.get("trackNumber"),
+                "disc_number": item.get("discNumber"),
+                "is_explicit": item.get("trackExplicitness") == "explicit",
+                "popularity": 0,
+                "artists": [item.get("artistName") or "Artista desconocido"],
+                "album": {
+                    "name": item.get("collectionName"),
+                    "uri": item.get("collectionViewUrl") or "",
+                    "id": item.get("collectionId"),
+                    "images": [item.get("artworkUrl100") or item.get("artworkUrl60") or ""],
+                },
+                "images": [item.get("artworkUrl100") or item.get("artworkUrl60") or ""],
+                "preview_url": audio_url,
+                "audio_url": audio_url,
+                "video_id": "",
+                "external_urls": {"apple": item.get("trackViewUrl") or ""},
+                "raw": item,
+            })
+        return tracks
+    except requests.RequestException:
+        return []
 
 
 def _safe_artist_names(data: dict[str, Any]) -> list[str]:
@@ -301,6 +351,8 @@ def buscar(q: str = Query(..., description="Texto a buscar"), limit: int = 10):
     artists = [_extract_artist_payload(item) for item in _extract_search_items(search, "artists")]
     albums = [_extract_album_payload(item) for item in _extract_search_items(search, "albums")]
     playlists = [_extract_playlist_payload(item) for item in _extract_search_items(search, "playlists")]
+    if not tracks:
+        tracks = _itunes_search(q, limit=limit)
 
     return {
         "query": q,
@@ -322,6 +374,8 @@ def buscar_canciones(q: str = Query(...), limit: int = 10):
 
     search = Song().query_songs(q, limit=limit)
     tracks = [_extract_track_payload(item) for item in _extract_search_items(search, "tracksV2")]
+    if not tracks:
+        tracks = _itunes_search(q, limit=limit)
     return {"query": q, "limit": limit, "results": {"tracks": tracks}}
 
 
@@ -369,6 +423,8 @@ def buscar_todo(q: str = Query(...), limit: int = 10):
     artists = [_extract_artist_payload(item) for item in _extract_search_items(search, "artists")]
     albums = [_extract_album_payload(item) for item in _extract_search_items(search, "albums")]
     playlists = [_extract_playlist_payload(item) for item in _extract_search_items(search, "playlists")]
+    if not tracks:
+        tracks = _itunes_search(q, limit=limit)
 
     return {
         "query": q,
@@ -428,6 +484,9 @@ def piped_search(q: str = Query(..., description="Texto a buscar en Piped"), lim
             items.append(track)
         if len(items) >= limit:
             break
+
+    if not items:
+        items = _itunes_search(q, limit=limit)
 
     return {
         "query": q,
