@@ -1,9 +1,54 @@
 from typing import Any
 
+import requests
 from fastapi import FastAPI, HTTPException, Query
 from spotapi import Artist, Song
 
 app = FastAPI(title="Spotify Public API", version="1.1.0")
+PIPED_API_HOSTS = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.nosebs.ru",
+]
+PIPED_BASE_URL = PIPED_API_HOSTS[0]
+
+
+def _piped_get(path: str, params: dict[str, Any] | None = None, timeout: int = 15) -> dict[str, Any] | list[Any]:
+    last_error: Exception | None = None
+    for base_url in PIPED_API_HOSTS:
+        try:
+            response = requests.get(f"{base_url}{path}", params=params, timeout=timeout)
+            if response.ok:
+                payload = response.json()
+                if isinstance(payload, (dict, list)):
+                    return payload
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise requests.RequestException(str(last_error))
+    return {}
+
+
+def _piped_video_by_id(video_id: str) -> dict[str, Any]:
+    if not video_id:
+        return {}
+
+    last_error: Exception | None = None
+    for base_url in PIPED_API_HOSTS:
+        for endpoint in (f"/api/v1/video/{video_id}", f"/api/v1/streams/{video_id}"):
+            try:
+                response = requests.get(f"{base_url}{endpoint}", timeout=15)
+                if response.ok:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        return payload
+            except requests.RequestException as exc:
+                last_error = exc
+                continue
+    if last_error is not None:
+        raise requests.RequestException(str(last_error))
+    return {}
 
 
 def _item_data(item: Any) -> dict[str, Any]:
@@ -87,6 +132,72 @@ def _extract_search_items(raw_response: dict[str, Any], section: str) -> list[di
         return []
     items = section_data.get("items", []) or []
     return [_item_data(item) for item in items if isinstance(item, dict)]
+
+
+def _pick_audio_url(item: dict[str, Any]) -> str:
+    if not isinstance(item, dict):
+        return ""
+
+    candidates: list[str] = []
+    for stream_group in (item.get("audioStreams"), item.get("audio_streams"), item.get("streams")):
+        if isinstance(stream_group, list):
+            for stream in stream_group:
+                if not isinstance(stream, dict):
+                    continue
+                url = stream.get("url") or stream.get("fileUrl") or stream.get("streamUrl")
+                if url:
+                    candidates.append(url)
+        elif isinstance(stream_group, dict):
+            url = stream_group.get("url") or stream_group.get("fileUrl") or stream_group.get("streamUrl")
+            if url:
+                candidates.append(url)
+
+    if candidates:
+        return candidates[0]
+
+    if item.get("url") and isinstance(item.get("url"), str):
+        return item["url"]
+
+    return ""
+
+
+def _piped_track_payload(item: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+
+    title = item.get("title") or item.get("name") or "Sin título"
+    video_id = item.get("videoId") or item.get("video_id") or item.get("id") or ""
+    uploader = item.get("uploader") or item.get("artist") or "Artista desconocido"
+    duration = item.get("duration")
+    duration_ms = None
+    if isinstance(duration, (int, float)):
+        duration_ms = int(duration * 1000)
+    elif isinstance(duration, str) and duration.isdigit():
+        duration_ms = int(int(duration) * 1000)
+
+    image = item.get("thumbnail") or item.get("thumbnailUrl") or ""
+    audio_url = _pick_audio_url(item)
+
+    return {
+        "name": title,
+        "id": video_id,
+        "uri": f"piped://{video_id}" if video_id else "",
+        "type": "track",
+        "playability": "PLAYABLE",
+        "duration_ms": duration_ms,
+        "track_number": 1,
+        "disc_number": 1,
+        "is_explicit": False,
+        "popularity": 0,
+        "artists": [uploader],
+        "album": {"name": uploader, "uri": "", "id": "", "images": [image] if image else []},
+        "images": [image] if image else [],
+        "preview_url": audio_url,
+        "audio_url": audio_url,
+        "video_id": video_id,
+        "external_urls": {"piped": f"{PIPED_BASE_URL}/watch?v={video_id}" if video_id else ""},
+        "raw": item,
+    }
 
 
 def _extract_playlist_payload(item: dict[str, Any]) -> dict[str, Any]:
@@ -269,3 +380,78 @@ def buscar_todo(q: str = Query(...), limit: int = 10):
             "playlists": playlists,
         },
     }
+
+
+@app.get("/piped/search")
+def piped_search(q: str = Query(..., description="Texto a buscar en Piped"), limit: int = 10):
+    q = q.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="q no puede ir vacío")
+
+    try:
+        payload = _piped_get("/api/v1/search", params={"q": q, "filter": "all"}, timeout=15)
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Error consultando Piped: {exc}") from exc
+
+    raw_items: list[Any] = []
+    if isinstance(payload, list):
+        raw_items = payload
+    elif isinstance(payload, dict):
+        raw_items = payload.get("items", []) or payload.get("results", []) or []
+
+    items: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+
+        track = _piped_track_payload(item)
+        video_id = track.get("video_id")
+        if not video_id:
+            continue
+
+        try:
+            detailed = _piped_video_by_id(video_id)
+            enriched_track = _piped_track_payload(detailed)
+            if enriched_track.get("audio_url"):
+                track = enriched_track
+            elif track.get("audio_url"):
+                track = track
+            else:
+                track["audio_url"] = ""
+        except requests.RequestException:
+            track["audio_url"] = track.get("audio_url", "")
+
+        if not track.get("audio_url"):
+            track["audio_url"] = ""
+
+        if track.get("name"):
+            items.append(track)
+        if len(items) >= limit:
+            break
+
+    return {
+        "query": q,
+        "limit": limit,
+        "results": {"tracks": items},
+    }
+
+
+@app.get("/piped/track/{video_id}")
+def piped_track(video_id: str):
+    video_id = video_id.strip()
+    if not video_id:
+        raise HTTPException(status_code=400, detail="video_id no puede ir vacío")
+
+    try:
+        payload = _piped_video_by_id(video_id)
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Error consultando Piped: {exc}") from exc
+
+    if not payload:
+        raise HTTPException(status_code=404, detail="No se encontró información del video")
+
+    track = _piped_track_payload(payload)
+    if not track.get("audio_url"):
+        raise HTTPException(status_code=404, detail="No se encontró una URL de audio para este video")
+
+    return {"track": track}

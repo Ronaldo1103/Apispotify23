@@ -4,3 +4,4 @@ spotapi
 pymongo
 redis
 websockets
+requests
