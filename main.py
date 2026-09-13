@@ -373,9 +373,40 @@ def _best_audio_from_ytdlp(info: dict[str, Any]) -> str:
     return best_url
 
 
+def _is_meaningful_search_query(query: str) -> bool:
+    raw = re.sub(r"\s+", " ", (query or "").strip())
+    if not raw:
+        return False
+
+    normalized = re.sub(r"[^a-z0-9\s-]", " ", raw.lower())
+    tokens = [token for token in normalized.split() if token]
+    if not tokens:
+        return False
+
+    if len(raw) < 3:
+        return False
+
+    stop_words = {
+        "a", "an", "and", "are", "as", "at", "be", "by", "d", "de", "del", "do",
+        "for", "from", "g", "in", "is", "it", "la", "of", "on", "or", "the", "to",
+        "y", "ya", "un", "una", "vs", "video", "song", "music"
+    }
+
+    if len(tokens) == 1 and tokens[0] in stop_words:
+        return False
+
+    if all(token in stop_words for token in tokens):
+        return False
+
+    return True
+
+
 def _youtube_search_variants(query: str, limit: int = 10) -> list[str]:
     raw = re.sub(r"\s+", " ", (query or "").strip())
     if not raw:
+        return []
+
+    if not _is_meaningful_search_query(raw):
         return []
 
     variants: list[str] = []
@@ -390,25 +421,20 @@ def _youtube_search_variants(query: str, limit: int = 10) -> list[str]:
     add_variant(raw)
     add_variant(f'"{raw}"')
     add_variant(f'{raw} official audio')
-    add_variant(f'{raw} audio')
     add_variant(f'{raw} lyrics')
 
     tokens = [token for token in raw.split() if len(token) > 2]
     if len(tokens) >= 2:
         add_variant(" ".join(tokens[:2]))
-        add_variant(" ".join(tokens[:3]))
-        add_variant(f'"{tokens[0]}" "{tokens[-1]}"')
+        add_variant(f'{tokens[0]} {tokens[-1]}')
         add_variant(f'{tokens[0]} {tokens[-1]} official')
 
     if " - " in raw:
         left, right = [part.strip() for part in raw.split(" - ", 1)]
         if left and right:
             add_variant(f'{left} {right}')
-            add_variant(f'{right} {left}')
 
-    if len(variants) > 1 and len(variants) > limit:
-        return variants[:limit]
-    return variants[:max(1, limit)]
+    return variants[: max(1, min(limit, 4))]
 
 
 @app.get("/")
@@ -525,6 +551,13 @@ def yt_search(q: str = Query(..., description="Texto a buscar con YouTube"), lim
     if not q:
         raise HTTPException(status_code=400, detail="q no puede ir vacío")
 
+    if not _is_meaningful_search_query(q):
+        return {
+            "query": q,
+            "limit": limit,
+            "results": {"tracks": []},
+        }
+
     ydl_opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
@@ -532,16 +565,17 @@ def yt_search(q: str = Query(..., description="Texto a buscar con YouTube"), lim
         "no_warnings": True,
         "skip_download": True,
         "default_search": "auto",
+        "extract_flat": False,
     }
 
     tracks: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    queries = _youtube_search_variants(q, limit=limit)
+    queries = _youtube_search_variants(q, limit=min(limit, 4))
 
     for query_variant in queries:
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                payload = ydl.extract_info(f"ytsearch{limit}:{query_variant}", download=False)
+                payload = ydl.extract_info(f"ytsearch{min(limit, 5)}:{query_variant}", download=False)
         except Exception:
             continue
 
@@ -550,12 +584,18 @@ def yt_search(q: str = Query(..., description="Texto a buscar con YouTube"), lim
             if not isinstance(entry, dict):
                 continue
 
-            video_id = entry.get("id") or ""
+            video_id = (entry.get("id") or "").strip()
             if not video_id or video_id in seen_ids:
                 continue
 
             title = (entry.get("title") or "").strip()
-            if not title:
+            if not title or len(title) < 3:
+                continue
+
+            if entry.get("is_live") or entry.get("live_status") in {"is_live", "was_live", "live"}:
+                continue
+
+            if entry.get("availability") in {"unavailable", "subscriber_only", "private"}:
                 continue
 
             audio_url = _best_audio_from_ytdlp(entry)
