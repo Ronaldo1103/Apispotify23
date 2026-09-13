@@ -1,6 +1,7 @@
 from typing import Any
 
 import requests
+import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
 from spotapi import Artist, Song
 
@@ -330,6 +331,40 @@ def _extract_track_payload(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _best_audio_from_ytdlp(info: dict[str, Any]) -> str:
+    if not isinstance(info, dict):
+        return ""
+
+    for key in ("url", "direct_url", "audio_url", "stream_url"):
+        value = info.get(key)
+        if isinstance(value, str) and value:
+            return value
+
+    best_url = ""
+    best_score = -1
+    for fmt in info.get("formats", []) or []:
+        if not isinstance(fmt, dict):
+            continue
+        url = fmt.get("url") or fmt.get("manifest_url") or fmt.get("fragment_base_url") or ""
+        if not url:
+            continue
+        if fmt.get("vcodec") not in (None, "none", ""):
+            continue
+
+        score = 0
+        if fmt.get("audio_ext"):
+            score += 10
+        if fmt.get("abr") is not None:
+            score += int(fmt["abr"])
+        if fmt.get("tbr") is not None:
+            score += int(fmt["tbr"])
+        if score > best_score:
+            best_url = url
+            best_score = score
+
+    return best_url
+
+
 @app.get("/")
 def home():
     return {"status": "ok", "message": "Spotify public backend ready"}
@@ -435,6 +470,68 @@ def buscar_todo(q: str = Query(...), limit: int = 10):
             "albums": albums,
             "playlists": playlists,
         },
+    }
+
+
+@app.get("/yt/search")
+def yt_search(q: str = Query(..., description="Texto a buscar con YouTube"), limit: int = 10):
+    q = q.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="q no puede ir vacío")
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "default_search": "auto",
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            payload = ydl.extract_info(f"ytsearch{limit}:{q}", download=False)
+    except Exception as exc:  # pragma: no cover - wrapper for external dependency failure
+        raise HTTPException(status_code=502, detail=f"Error consultando YouTube: {exc}") from exc
+
+    entries = payload.get("entries", []) if isinstance(payload, dict) else []
+    tracks: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        audio_url = _best_audio_from_ytdlp(entry)
+        if not audio_url:
+            continue
+        tracks.append({
+            "name": entry.get("title") or "Sin título",
+            "id": entry.get("id") or "",
+            "uri": entry.get("webpage_url") or entry.get("url") or "",
+            "type": "track",
+            "playability": "PLAYABLE",
+            "duration_ms": int((entry.get("duration") or 0) * 1000) if isinstance(entry.get("duration"), (int, float)) else None,
+            "track_number": 1,
+            "disc_number": 1,
+            "is_explicit": False,
+            "popularity": 0,
+            "artists": [entry.get("uploader") or "Artista desconocido"],
+            "album": {
+                "name": "",
+                "uri": "",
+                "id": "",
+                "images": [entry.get("thumbnail") or ""] if entry.get("thumbnail") else [],
+            },
+            "images": [entry.get("thumbnail") or ""] if entry.get("thumbnail") else [],
+            "preview_url": audio_url,
+            "audio_url": audio_url,
+            "video_id": entry.get("id") or "",
+            "external_urls": {"youtube": entry.get("webpage_url") or ""},
+            "raw": entry,
+        })
+
+    return {
+        "query": q,
+        "limit": limit,
+        "results": {"tracks": tracks},
     }
 
 

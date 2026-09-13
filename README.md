@@ -2,13 +2,14 @@
 
 Backend en FastAPI para búsquedas musicales y reproducción con fallback de audio público.
 
-Este servicio expone endpoints para buscar canciones, artistas, álbumes, playlists y también ofrece una capa con Piped y un fallback a iTunes para devolver URLs de preview/audio reales cuando Piped está caído.
+Este servicio expone endpoints para buscar canciones, artistas, álbumes, playlists y también ofrece una capa con YouTube mediante `yt-dlp`, con Piped y un fallback a iTunes como estrategia de respaldo.
 
 ## Funcionalidad
 
 - Búsqueda pública de música con SpotAPI
 - Endpoints de búsqueda por tipo
 - Búsqueda con Piped
+- Búsqueda con YouTube (`yt-dlp`) para demo local/personal de audio completo
 - Fallback a Apple iTunes cuando Piped falla
 - Healthcheck y status
 - Preparado para deploy en Railway
@@ -39,6 +40,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 - GET `/buscar-albumes?q=coldplay&limit=10`
 - GET `/buscar-playlists?q=coldplay&limit=10`
 - GET `/buscar-todo?q=coldplay&limit=10`
+- GET `/yt/search?q=coldplay&limit=10` → demo local/personal con `yt-dlp`
 - GET `/piped/search?q=coldplay&limit=10`
 - GET `/piped/track/{video_id}`
 
@@ -83,7 +85,9 @@ curl "http://localhost:8000/piped/search?q=coldplay&limit=3"
 
 ## Nota importante
 
-La fuente Piped puede caer o devolver errores de SSL/502. Por eso el backend tiene un fallback a iTunes para devolver previews de audio reales. Esto permite seguir teniendo resultados reproducibles en desarrollo y en despliegues temporales.
+La fuente Piped puede caer o devolver errores de SSL/502. Por eso el backend tiene un fallback a iTunes para devolver previews de audio reales. Además, para una demo local/personal, el endpoint `/yt/search` usa `yt-dlp` para obtener una URL de audio real de YouTube.
+
+Esto permite probar el flujo completo del reproductor en desarrollo, pero no es una solución pública ni comercial de streaming musical.
 
 ## Licencia
 
