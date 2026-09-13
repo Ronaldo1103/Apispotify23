@@ -63,6 +63,13 @@ def _item_data(item: Any) -> dict[str, Any]:
     return item
 
 
+def _is_preview_audio_url(url: str | None) -> bool:
+    if not isinstance(url, str):
+        return False
+    candidate = url.lower()
+    return any(token in candidate for token in ("preview", "mzstatic", "itunes.apple.com", "audio-ssl.itunes.apple.com"))
+
+
 def _itunes_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
     try:
         response = requests.get(
@@ -82,7 +89,7 @@ def _itunes_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
             if not isinstance(item, dict):
                 continue
             audio_url = item.get("previewUrl") or item.get("preview_url") or ""
-            if not audio_url:
+            if not audio_url or _is_preview_audio_url(audio_url):
                 continue
             tracks.append({
                 "name": item.get("trackName") or item.get("name") or "Sin título",
