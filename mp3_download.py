@@ -17,6 +17,47 @@ else:
 router = APIRouter()
 
 
+def _youtube_downloader_options(output_dir: Path | None = None) -> dict:
+    options = {
+        'format': 'bestaudio/best',
+        'noplaylist': True,
+        'quiet': True,
+        'socket_timeout': 30,
+        'retries': 2,
+    }
+    if output_dir is not None:
+        options.update({
+            'outtmpl': str(output_dir / 'audio.%(ext)s'),
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        })
+    return options
+
+
+@router.get('/youtube/mp3/check/{video_id}')
+def check_mp3(video_id: str):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+        raise HTTPException(400, 'Identificador de YouTube no válido')
+    try:
+        with yt_dlp.YoutubeDL({**_youtube_downloader_options(), **youtube_options()}) as downloader:
+            info = downloader.extract_info(
+                f'https://www.youtube.com/watch?v={video_id}',
+                download=False,
+            )
+        if not info or not info.get('id'):
+            raise RuntimeError('YouTube no devolvió información del video')
+        return {
+            'video_id': video_id,
+            'available': True,
+            'title': info.get('title') or '',
+        }
+    except Exception as exc:
+        raise youtube_error(exc) from exc
+
+
 @router.get('/youtube/mp3/{video_id}')
 def download_mp3(video_id: str):
     if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
@@ -27,19 +68,7 @@ def download_mp3(video_id: str):
     temporary = TemporaryDirectory(prefix='spotify-mp3-')
     try:
         output = Path(temporary.name) / 'audio.mp3'
-        options = {
-            'format': 'bestaudio/best',
-            'noplaylist': True,
-            'quiet': True,
-            'socket_timeout': 30,
-            'retries': 2,
-            'outtmpl': str(Path(temporary.name) / 'audio.%(ext)s'),
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-        }
+        options = _youtube_downloader_options(Path(temporary.name))
         with yt_dlp.YoutubeDL({**options, **shared_options}) as downloader:
             downloader.extract_info(f'https://www.youtube.com/watch?v={video_id}', download=True)
         if not output.is_file() or output.stat().st_size == 0:
