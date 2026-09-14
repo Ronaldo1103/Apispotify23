@@ -142,3 +142,22 @@ en formato Netscape de una sesión propia. No subas cookies a GitHub ni las pegu
 en chats: permiten acceder a la sesión. Configura el archivo en almacenamiento
 privado del servidor. Las cookies pueden caducar y no garantizan resolver un
 bloqueo de la IP. No se extraen cookies automáticamente del navegador.
+
+### Cookies en Railway mediante una variable secreta
+
+Configura `YOUTUBE_COOKIES_BASE64` con el contenido Base64 del TXT Netscape.
+Tiene prioridad sobre `YOUTUBE_COOKIES_FILE`, por lo que no se usa la ruta de
+Windows en Railway. El archivo se crea al solicitar una extracción, en una carpeta
+temporal privada del proceso, y se reutiliza. No se imprime su contenido.
+Para renovar la sesión, cambia la variable y reinicia el servicio.
+
+En PowerShell puedes copiar el valor al portapapeles sin imprimirlo:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\Users\Ronaldo\Documents\Project-Spotify\spotify_backend\.private\youtube-cookies.txt")) | Set-Clipboard
+```
+
+Pega ese valor en la variable secreta de Railway y vuelve a desplegar el backend.
+No lo guardes en `.env.example`, GitHub ni logs. Base64 no cifra las cookies.
+La configuración local `YOUTUBE_COOKIES_FILE` sigue funcionando cuando no hay
+`YOUTUBE_COOKIES_BASE64`. El despliegue debe tener `python-dotenv` instalado.

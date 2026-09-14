@@ -7,3 +7,5 @@ websockets
 requests
 yt-dlp[default]
 pyDes
+
+python-dotenv
