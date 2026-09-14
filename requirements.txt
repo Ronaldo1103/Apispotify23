@@ -6,3 +6,4 @@ redis
 websockets
 requests
 yt-dlp
+pyDes

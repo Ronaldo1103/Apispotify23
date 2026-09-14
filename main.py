@@ -1,9 +1,18 @@
+import base64
+import difflib
+import html
+import json
+import os
 import re
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from pyDes import ECB, PAD_PKCS5, des
 import requests
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from spotapi import Artist, Song
 
 app = FastAPI(title="Spotify Public API", version="1.1.0")
@@ -12,6 +21,9 @@ PIPED_API_HOSTS = [
     "https://pipedapi.leptons.xyz",
 ]
 PIPED_BASE_URL = PIPED_API_HOSTS[0]
+REQUEST_TIMEOUT_SECONDS = 8
+HTTP_SESSION = requests.Session()
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 
 def _piped_get(path: str, params: dict[str, Any] | None = None, timeout: int = 15) -> dict[str, Any] | list[Any]:
@@ -69,6 +81,129 @@ def _is_preview_audio_url(url: str | None) -> bool:
         return False
     candidate = url.lower()
     return any(token in candidate for token in ("preview", "mzstatic", "itunes.apple.com", "audio-ssl.itunes.apple.com"))
+
+
+def _youtube_duration_ms(value: str) -> int | None:
+    match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value or "")
+    if not match:
+        return None
+    hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return (hours * 3600 + minutes * 60 + seconds) * 1000
+
+
+def _youtube_music_score(title: str, channel: str, duration_ms: int | None) -> int:
+    text = _normalized_match_text(f"{title} {channel}")
+    channel_text = _normalized_match_text(channel)
+    blocked_terms = {
+        "review", "reaction", "reaccion", "resumen", "recap", "explicado",
+        "explicacion", "analysis", "analisis", "entrevista", "podcast",
+        "clip", "escena", "scene", "episodio", "episode", "trailer",
+        "teaser", "short", "noticia", "news", "ranking", "top 10",
+        "karaoke", "cover", "instrumental", "piano", "slowed", "reverb",
+        "nightcore", "speed up", "sped up", "remix", "mashup", "fanmade",
+    }
+    blocked_channel_prefixes = ("resum", "senpai", "noticias", "news", "review", "reaction")
+    if any(term in text for term in blocked_terms) or any(
+        channel_text.startswith(prefix) for prefix in blocked_channel_prefixes
+    ):
+        return -100
+
+    if duration_ms is not None and (duration_ms < 90_000 or duration_ms > 600_000):
+        return -100
+
+    score = 0
+    if "topic" in channel_text or "official" in channel_text:
+        score += 30
+    if any(term in text for term in ("official audio", "official music video", "audio")):
+        score += 20
+    if duration_ms is not None and 90_000 <= duration_ms <= 600_000:
+        score += 10
+    return score
+
+
+def _youtube_api_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
+    if not YOUTUBE_API_KEY:
+        return []
+
+    try:
+        search_response = requests.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={
+                "key": YOUTUBE_API_KEY,
+                "part": "snippet",
+                "q": query,
+                "type": "video",
+                "maxResults": 25,
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        search_response.raise_for_status()
+        search_payload = search_response.json()
+        items = search_payload.get("items", []) if isinstance(search_payload, dict) else []
+    except (requests.RequestException, ValueError):
+        return []
+
+    video_ids = [
+        item.get("id", {}).get("videoId")
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("id"), dict)
+    ]
+    video_ids = [video_id for video_id in video_ids if video_id]
+    durations: dict[str, int | None] = {}
+    if video_ids:
+        try:
+            details_response = requests.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={
+                    "key": YOUTUBE_API_KEY,
+                    "part": "contentDetails",
+                    "id": ",".join(video_ids),
+                },
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            details_response.raise_for_status()
+            details_payload = details_response.json()
+            for item in details_payload.get("items", []) if isinstance(details_payload, dict) else []:
+                if isinstance(item, dict):
+                    durations[item.get("id", "")] = _youtube_duration_ms(
+                        item.get("contentDetails", {}).get("duration", "")
+                    )
+        except (requests.RequestException, ValueError):
+            pass
+
+    tracks: list[tuple[int, dict[str, Any]]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        video_id = item.get("id", {}).get("videoId")
+        snippet = item.get("snippet", {})
+        if not video_id or not isinstance(snippet, dict):
+            continue
+        thumbnail = (snippet.get("thumbnails", {}).get("high") or snippet.get("thumbnails", {}).get("default") or {}).get("url", "")
+        title = snippet.get("title") or "Sin título"
+        channel = snippet.get("channelTitle") or "Canal desconocido"
+        duration_ms = durations.get(video_id)
+        score = _youtube_music_score(title, channel, duration_ms)
+        if score < 0:
+            continue
+        tracks.append((score, {
+            "name": title,
+            "id": video_id,
+            "uri": f"https://www.youtube.com/watch?v={video_id}",
+            "type": "track",
+            "playability": "PLAYABLE",
+            "duration_ms": duration_ms,
+            "artists": [channel],
+            "album": {"name": "YouTube", "uri": "", "id": "", "images": [thumbnail] if thumbnail else []},
+            "images": [thumbnail] if thumbnail else [],
+            "preview_url": "",
+            "audio_url": "",
+            "video_id": video_id,
+            "external_urls": {"youtube": f"https://www.youtube.com/watch?v={video_id}"},
+            "raw": item,
+        }))
+    tracks.sort(key=lambda entry: entry[0], reverse=True)
+    return [track for _, track in tracks[: max(1, min(limit, 25))]]
 
 
 def _itunes_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -437,6 +572,262 @@ def _youtube_search_variants(query: str, limit: int = 10) -> list[str]:
     return variants[: max(1, min(limit, 4))]
 
 
+def _saavn_json_decode(text: str) -> Any:
+    if not isinstance(text, str):
+        return {}
+    cleaned = text.strip()
+    if not cleaned:
+        return {}
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            return {}
+
+
+def _decrypt_saavn_media_url(encrypted_url: str) -> str:
+    if not isinstance(encrypted_url, str) or not encrypted_url.strip():
+        return ""
+    try:
+        cipher = des(
+            b"38346591",
+            ECB,
+            b"\0" * 8,
+            pad=None,
+            padmode=PAD_PKCS5,
+        )
+        decoded = cipher.decrypt(
+            base64.b64decode(encrypted_url.strip()),
+            padmode=PAD_PKCS5,
+        ).decode("utf-8")
+        return decoded.replace("_96.mp4", "_320.mp4")
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return ""
+
+
+def _saavn_search(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    try:
+        response = requests.get(
+            "https://www.jiosaavn.com/api.php",
+            params={
+                "__call": "autocomplete.get",
+                "_format": "json",
+                "_marker": "0",
+                "cc": "in",
+                "includeMetaTags": "1",
+                "query": q,
+            },
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = _saavn_json_decode(response.text)
+    except requests.RequestException:
+        return []
+
+    if not isinstance(payload, dict):
+        return []
+
+    songs = payload.get("songs", {}).get("data", []) if isinstance(payload.get("songs"), dict) else []
+    if not isinstance(songs, list):
+        return []
+
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in songs[: max(1, min(limit * 2, 6))]:
+        if not isinstance(item, dict):
+            continue
+        song_id = item.get("id") or item.get("song_id") or ""
+        if not song_id:
+            continue
+
+        title = str(item.get("song") or item.get("title") or "").strip()
+        artist = str(item.get("primary_artists") or item.get("music") or "").strip()
+        key = f"{title}|{artist}|{song_id}".lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        try:
+            details = requests.get(
+                "https://www.jiosaavn.com/api.php",
+                params={
+                    "__call": "song.getDetails",
+                    "cc": "in",
+                    "_marker": "0",
+                    "_format": "json",
+                    "pids": song_id,
+                },
+                timeout=8,
+            )
+            details.raise_for_status()
+            details_payload = _saavn_json_decode(details.text)
+        except requests.RequestException:
+            continue
+
+        track_data = details_payload.get(song_id, {}) if isinstance(details_payload, dict) else {}
+        if not isinstance(track_data, dict):
+            continue
+
+        media_url = track_data.get("media_url") or ""
+        if not media_url:
+            media_url = _decrypt_saavn_media_url(track_data.get("encrypted_media_url") or "")
+        if not media_url:
+            continue
+
+        results.append({
+            "id": song_id,
+            "song": track_data.get("song") or title or "Sin título",
+            "title": track_data.get("song") or title or "Sin título",
+            "artists": [track_data.get("primary_artists") or artist or "Artista desconocido"],
+            "album": track_data.get("album") or item.get("album") or "",
+            "image": track_data.get("image") or item.get("image") or "",
+            "perma_url": track_data.get("perma_url") or item.get("perma_url") or "",
+            "media_url": media_url,
+            "raw": track_data,
+        })
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+def _saavn_search_many(queries: list[str], limit: int = 5) -> list[dict[str, Any]]:
+    query_list = [q.strip() for q in (queries or []) if isinstance(q, str) and q.strip()]
+    if not query_list:
+        return []
+
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _search_one(query: str) -> list[dict[str, Any]]:
+        return _saavn_search(query, limit=max(1, min(2, limit)))
+
+    with ThreadPoolExecutor(max_workers=min(4, len(query_list))) as executor:
+        for batch in executor.map(_search_one, query_list[: min(4, len(query_list))]):
+            for item in batch:
+                key = (item.get("id") or item.get("title") or "").lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+                if len(merged) >= limit:
+                    return merged
+
+    return merged[:limit]
+
+
+def _normalized_match_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _saavn_matches_spotify_track(
+    spotify_track: dict[str, Any], saavn_track: dict[str, Any]
+) -> bool:
+    spotify_title = _normalized_match_text(spotify_track.get("name"))
+    saavn_title = _normalized_match_text(saavn_track.get("title"))
+    if not spotify_title or not saavn_title:
+        return False
+
+    title_matches = (
+        spotify_title == saavn_title
+        or spotify_title in saavn_title
+        or saavn_title in spotify_title
+        or difflib.SequenceMatcher(None, spotify_title, saavn_title).ratio() >= 0.82
+    )
+    if not title_matches:
+        return False
+
+    spotify_artists = spotify_track.get("artists") or []
+    saavn_artists = saavn_track.get("artists") or []
+    if isinstance(spotify_artists, str):
+        spotify_artists = [spotify_artists]
+    if isinstance(saavn_artists, str):
+        saavn_artists = [saavn_artists]
+
+    spotify_artist_text = " ".join(
+        _normalized_match_text(artist) for artist in spotify_artists
+    ).strip()
+    saavn_artist_text = " ".join(
+        _normalized_match_text(artist) for artist in saavn_artists
+    ).strip()
+    if not spotify_artist_text or not saavn_artist_text:
+        return False
+
+    spotify_artist_tokens = set(spotify_artist_text.split())
+    saavn_artist_tokens = set(saavn_artist_text.split())
+    artist_overlap = spotify_artist_tokens & saavn_artist_tokens
+    return bool(
+        spotify_artist_text in saavn_artist_text
+        or saavn_artist_text in spotify_artist_text
+        or artist_overlap
+    )
+
+
+def _spotify_track_matches_query(track: dict[str, Any], query: str) -> bool:
+    query_tokens = set(_normalized_match_text(query).split())
+    if not query_tokens:
+        return True
+
+    searchable_values = [
+        track.get("name"),
+        *(track.get("artists") or []),
+        (track.get("album") or {}).get("name"),
+    ]
+    searchable_text = _normalized_match_text(" ".join(str(value or "") for value in searchable_values))
+    return any(token in searchable_text.split() for token in query_tokens)
+
+
+def _saavn_queries_from_spotify_track(track: dict[str, Any]) -> list[str]:
+    name = (track.get("name") or "").strip()
+    artists = track.get("artists") or []
+    if isinstance(artists, str):
+        artists = [artists]
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        value = re.sub(r"\s+", " ", (value or "").strip())
+        if value and value.lower() not in seen:
+            seen.add(value.lower())
+            candidates.append(value)
+
+    for artist in artists:
+        artist_name = (artist or "").strip()
+        if not artist_name:
+            continue
+        add(f"{artist_name} {name}")
+        add(f"{name} {artist_name}")
+    add(name)
+
+    if not candidates and name:
+        add(name)
+
+    return candidates[:2]
+
+
+def _spotify_tracks_for_query(query: str, limit: int = 5) -> list[dict[str, Any]]:
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        search = Song().query_songs(q, limit=limit)
+    except Exception:
+        return []
+    tracks = [_extract_track_payload(item) for item in _extract_search_items(search, "tracksV2")]
+    related_tracks = [track for track in tracks if _spotify_track_matches_query(track, q)]
+    return (related_tracks or tracks)[:limit]
+
+
 @app.get("/")
 def home():
     return {"status": "ok", "message": "Spotify public backend ready"}
@@ -445,6 +836,216 @@ def home():
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+
+@app.get("/youtube/search")
+def youtube_search(q: str = Query(..., description="Buscar metadatos de videos en YouTube"), limit: int = 10):
+    q = q.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="q no puede ir vacío")
+    if not YOUTUBE_API_KEY:
+        raise HTTPException(status_code=503, detail="YOUTUBE_API_KEY no está configurada")
+    return {"query": q, "limit": limit, "results": {"tracks": _youtube_api_search(q, limit)}}
+
+
+@app.get("/youtube/url")
+def youtube_url(title: str = Query(...), artist: str = Query("")):
+    query = " ".join(part.strip() for part in (title, artist) if part.strip())
+    if not query:
+        raise HTTPException(status_code=400, detail="title no puede ir vacío")
+    if not YOUTUBE_API_KEY:
+        raise HTTPException(status_code=503, detail="YOUTUBE_API_KEY no está configurada")
+
+    results = _youtube_api_search(query, limit=5)
+    if not results:
+        raise HTTPException(status_code=404, detail="No se encontró un video musical")
+
+    selected = results[0]
+    video_id = selected.get("video_id") or ""
+    return {
+        "title": selected.get("name"),
+        "artist": (selected.get("artists") or [""])[0],
+        "video_id": video_id,
+        "video_url": f"https://www.youtube.com/watch?v={video_id}",
+        "duration_ms": selected.get("duration_ms"),
+    }
+
+
+@app.get("/youtube/resolve/{video_id}")
+def youtube_resolve(video_id: str):
+    video_id = video_id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", video_id):
+        raise HTTPException(status_code=400, detail="video_id no válido")
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"No se pudo resolver el audio: {exc}") from exc
+
+    audio_url = _best_audio_from_ytdlp(info)
+    if not audio_url or _is_preview_audio_url(audio_url):
+        raise HTTPException(status_code=404, detail="No se encontró audio reproducible")
+
+    return {
+        "track": {
+            "name": info.get("title") or "Sin título",
+            "id": video_id,
+            "uri": info.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}",
+            "type": "track",
+            "playability": "PLAYABLE",
+            "duration_ms": int(info.get("duration", 0) * 1000) if isinstance(info.get("duration"), (int, float)) else None,
+            "artists": [info.get("uploader") or "Canal desconocido"],
+            "album": {"name": "YouTube", "uri": "", "id": "", "images": [info.get("thumbnail", "")]},
+            "images": [info.get("thumbnail", "")],
+            "preview_url": audio_url,
+            "audio_url": audio_url,
+            "video_id": video_id,
+            "external_urls": {"youtube": info.get("webpage_url") or ""},
+        }
+    }
+
+
+@app.get("/debug/youtube", response_class=HTMLResponse)
+def youtube_debug(q: str = Query("The Promise Deaimon", description="Texto para probar YouTube Data API"), limit: int = 5):
+    query = q.strip() or "The Promise Deaimon"
+    results = _youtube_api_search(query, limit=max(1, min(limit, 10))) if YOUTUBE_API_KEY else []
+    status = "Clave configurada" if YOUTUBE_API_KEY else "Falta configurar YOUTUBE_API_KEY"
+    status_color = "#55d187" if YOUTUBE_API_KEY else "#ff8b8b"
+    rows: list[str] = []
+    for item in results:
+        video_id = html.escape(str(item.get("video_id", "")))
+        title = html.escape(str(item.get("name", "Sin título")))
+        artist = html.escape(str((item.get("artists") or ["Canal desconocido"])[0]))
+        duration = item.get("duration_ms")
+        duration_text = f"{int(duration // 60000)}:{int((duration % 60000) // 1000):02d}" if isinstance(duration, int) else "duración no disponible"
+        rows.append(
+            f"<article><h2>{title}</h2><p><b>Canal:</b> {artist} | <b>Duración:</b> {duration_text}</p>"
+            f"<a href='https://www.youtube.com/watch?v={video_id}' target='_blank'>Abrir video en YouTube</a>"
+            f"<p class='id'>Video ID: {video_id}</p></article>"
+        )
+    if not rows and YOUTUBE_API_KEY:
+        rows.append("<p>No se encontraron videos para esa búsqueda.</p>")
+    if not YOUTUBE_API_KEY:
+        rows.append("<p>Configura YOUTUBE_API_KEY en el entorno del backend y reinicia Uvicorn.</p>")
+
+    return HTMLResponse(content=f"""
+    <!doctype html>
+    <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>YouTube API debug</title>
+    <style>
+      body {{ font-family: system-ui, sans-serif; max-width: 860px; margin: 32px auto; padding: 0 18px; background: #101417; color: #f4f7f8; }}
+      h1 {{ margin-bottom: 8px; }} form {{ display: flex; gap: 8px; margin: 24px 0; }}
+      input {{ flex: 1; padding: 12px; border-radius: 8px; border: 1px solid #39464d; background: #1b2429; color: white; }}
+      button {{ padding: 12px 18px; border: 0; border-radius: 8px; background: #ff0033; color: white; font-weight: 700; cursor: pointer; }}
+      article {{ padding: 16px; margin: 12px 0; border: 1px solid #334047; border-radius: 10px; background: #182126; }}
+      article h2 {{ font-size: 18px; margin: 0 0 8px; }} a {{ color: #8fd3ff; }} .id {{ color: #94a5ad; font-size: 12px; }}
+      .status {{ color: {status_color}; font-weight: 700; }}
+    </style></head><body>
+      <h1>YouTube Data API</h1><p class="status">Estado: {status}</p>
+      <form method="get" action="/debug/youtube"><input name="q" value="{html.escape(query)}" placeholder="Canción, artista o anime"><button>Buscar</button></form>
+      <p>Consulta: <b>{html.escape(query)}</b></p>{''.join(rows)}
+    </body></html>
+    """)
+
+
+@app.get("/saavn/search")
+def saavn_search(q: str = Query(..., description="Buscar en JioSaavn usando metadatos de Spotify"), limit: int = 5):
+    q = q.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="q no puede ir vacío")
+
+    spotify_tracks = _spotify_tracks_for_query(q, limit=limit)
+    matched_results: list[dict[str, Any]] = []
+    seen_tracks: set[str] = set()
+
+    for track in spotify_tracks[: max(1, min(limit, 3))]:
+        candidate_queries = _saavn_queries_from_spotify_track(track)
+        saavn_results = _saavn_search_many(candidate_queries, limit=2)
+        for saavn_item in saavn_results:
+            if not _saavn_matches_spotify_track(track, saavn_item):
+                continue
+            title = (saavn_item.get("title") or "").lower()
+            if title and title in seen_tracks:
+                continue
+            matched_results.append({
+                "spotify_query": q,
+                "jiosaavn_query": candidate_queries[0] if candidate_queries else q,
+                "spotify_track": track,
+                "saavn_track": saavn_item,
+            })
+            if title:
+                seen_tracks.add(title)
+            if len(matched_results) >= limit:
+                break
+        if len(matched_results) >= limit:
+            break
+
+    return {"query": q, "limit": limit, "results": matched_results}
+
+
+@app.get("/debug/saavn", response_class=HTMLResponse)
+def saavn_debug(q: str = Query("coldplay", description="Texto para probar resultados de JioSaavn"), limit: int = 5):
+    q = q.strip() or "coldplay"
+    spotify_tracks = _spotify_tracks_for_query(q, limit=limit)
+
+    rows: list[str] = []
+    if not spotify_tracks:
+        rows.append(f"<p>No se encontraron resultados de Spotify para '{q}'.</p>")
+
+    for track in spotify_tracks[: max(1, min(limit, 3))]:
+        candidates = _saavn_queries_from_spotify_track(track)
+        rows.append(f"<div class='card'><h3>{track.get('name', 'Sin título')}</h3>")
+        rows.append(f"<p><b>Spotify:</b> {track.get('artists', ['Artista desconocido'])[0]} | {track.get('album', {}).get('name', 'Sin álbum')}</p>")
+        rows.append("<ul>")
+        saavn_results = [
+            item for item in _saavn_search_many(candidates, limit=2)
+            if _saavn_matches_spotify_track(track, item)
+        ]
+        if not saavn_results:
+            rows.append("<li>No se encontraron resultados reales en JioSaavn.</li>")
+        for saavn_item in saavn_results:
+            media_url = saavn_item.get('media_url') or ''
+            rows.append(
+                f"<li><b>{saavn_item.get('title')}</b> - {saavn_item.get('artists', ['Artista desconocido'])[0]}<br>"
+                f"album: {saavn_item.get('album') or 'N/A'}<br>"
+                f"media_url: <a href='{media_url}' target='_blank'>{media_url}</a></li>"
+            )
+        rows.append("</ul></div>")
+
+    html = f"""
+    <html>
+      <head>
+        <title>JioSaavn debug</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <style>
+          body {{ font-family: Arial, sans-serif; margin: 24px; background: #121212; color: #f5f5f5; }}
+          a {{ color: #8ec5ff; }}
+          .card {{ border: 1px solid #333; padding: 16px; border-radius: 12px; margin-bottom: 18px; background: #1b1b1b; }}
+          input, button {{ padding: 10px 12px; border-radius: 8px; border: 1px solid #444; margin-right: 8px; }}
+          button {{ background: #1db954; color: white; border: none; cursor: pointer; }}
+          form {{ margin-bottom: 22px; }}
+        </style>
+      </head>
+      <body>
+        <h1>JioSaavn + Spotify metadata debug</h1>
+        <form method="get" action="/debug/saavn">
+          <input type="text" name="q" value="{q}" placeholder="Busca una canción o artista" />
+          <button type="submit">Buscar</button>
+        </form>
+        <p>Consulta original: <b>{q}</b></p>
+        {''.join(rows)}
+      </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
 
 
 @app.get("/buscar")
