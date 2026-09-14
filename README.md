@@ -103,3 +103,25 @@ YouTube Data API devuelve metadatos y la URL oficial del video, no una URL MP3 n
 ## Licencia
 
 Usa la licencia del proyecto según tus necesidades.
+
+## Descargas MP3 desde Android
+
+Al tocar una canción en Flutter se inicia su reproducción y una descarga MP3.
+Android guarda el archivo en la carpeta pública **Descargas**, muestra una
+notificación y puede continuar la descarga fuera de la app. La interfaz muestra
+el progreso mientras permanece abierta. Se permite una descarga supervisada a la
+vez; si hay otra en curso se informa al usuario.
+
+El cliente consulta `/youtube/url` con título y artista y descarga
+`GET /youtube/mp3/{video_id}` del mismo backend. El servidor utiliza yt-dlp y
+FFmpeg para convertir a MP3 a 192 kbps; los archivos temporales se limpian después
+de enviarse o si la conversión falla. El endpoint no acepta URLs arbitrarias.
+
+Se requieren `ffmpeg` y `ffprobe` en PATH, además de las dependencias de
+`requirements.txt`. `nixpacks.toml` añade FFmpeg al despliegue Railway. Es necesario
+publicar estos cambios del backend antes de usar la función contra Railway.
+No basta con actualizar el APK. YouTube puede rechazar una descarga aunque exista
+un resultado de búsqueda; en ese caso Android informa del fallo.
+
+Comprobación local: `python -m unittest discover -s . -p test_mp3_download.py -v`.
+Las pruebas convierten un tono generado localmente y no descargan canciones.

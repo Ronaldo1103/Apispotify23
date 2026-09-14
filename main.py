@@ -16,6 +16,11 @@ from fastapi.responses import HTMLResponse
 from spotapi import Artist, Song
 
 app = FastAPI(title="Spotify Public API", version="1.1.0")
+if __package__:
+    from .mp3_download import router as mp3_router
+else:
+    from mp3_download import router as mp3_router
+app.include_router(mp3_router)
 PIPED_API_HOSTS = [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.leptons.xyz",
