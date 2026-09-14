@@ -5,5 +5,5 @@ pymongo
 redis
 websockets
 requests
-yt-dlp
+yt-dlp[default]
 pyDes

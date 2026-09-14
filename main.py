@@ -18,8 +18,10 @@ from spotapi import Artist, Song
 app = FastAPI(title="Spotify Public API", version="1.1.0")
 if __package__:
     from .mp3_download import router as mp3_router
+    from .youtube_config import youtube_options, youtube_error
 else:
     from mp3_download import router as mp3_router
+    from youtube_config import youtube_options, youtube_error
 app.include_router(mp3_router)
 PIPED_API_HOSTS = [
     "https://pipedapi.kavin.rocks",
@@ -890,10 +892,10 @@ def youtube_resolve(video_id: str):
         "skip_download": True,
     }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL({**ydl_opts, **youtube_options()}) as ydl:
             info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"No se pudo resolver el audio: {exc}") from exc
+        raise youtube_error(exc) from exc
 
     audio_url = _best_audio_from_ytdlp(info)
     if not audio_url or _is_preview_audio_url(audio_url):
@@ -1180,7 +1182,7 @@ def yt_search(q: str = Query(..., description="Texto a buscar con YouTube"), lim
 
     for query_variant in queries:
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL({**ydl_opts, **youtube_options()}) as ydl:
                 payload = ydl.extract_info(f"ytsearch{min(limit, 5)}:{query_variant}", download=False)
         except Exception:
             continue

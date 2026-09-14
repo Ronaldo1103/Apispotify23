@@ -125,3 +125,20 @@ un resultado de búsqueda; en ese caso Android informa del fallo.
 
 Comprobación local: `python -m unittest discover -s . -p test_mp3_download.py -v`.
 Las pruebas convierten un tono generado localmente y no descargan canciones.
+
+### JavaScript y bloqueos de YouTube
+
+Railway instala Node.js 22 mediante Nixpacks y `yt-dlp[default]` instala los
+componentes EJS. `youtube_config.py` habilita Node en todas las extracciones.
+Estos cambios requieren reconstruir el despliegue.
+
+Un error 429 indica que YouTube está limitando las solicitudes. El backend devuelve
+429 con Retry-After de 300 segundos; esto no garantiza que el bloqueo termine en
+ese plazo. La exigencia de verificar una sesión devuelve 503. Instalar Node no
+elimina esos bloqueos.
+
+Opcionalmente, YOUTUBE_COOKIES_FILE admite la ruta a un archivo privado de cookies
+en formato Netscape de una sesión propia. No subas cookies a GitHub ni las pegues
+en chats: permiten acceder a la sesión. Configura el archivo en almacenamiento
+privado del servidor. Las cookies pueden caducar y no garantizan resolver un
+bloqueo de la IP. No se extraen cookies automáticamente del navegador.
