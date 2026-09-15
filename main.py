@@ -98,7 +98,12 @@ def _youtube_duration_ms(value: str) -> int | None:
     return (hours * 3600 + minutes * 60 + seconds) * 1000
 
 
-def _youtube_music_score(title: str, channel: str, duration_ms: int | None) -> int:
+def _youtube_music_score(
+    query: str,
+    title: str,
+    channel: str,
+    duration_ms: int | None,
+) -> int:
     text = _normalized_match_text(f"{title} {channel}")
     channel_text = _normalized_match_text(channel)
     blocked_terms = {
@@ -108,8 +113,13 @@ def _youtube_music_score(title: str, channel: str, duration_ms: int | None) -> i
         "teaser", "short", "noticia", "news", "ranking", "top 10",
         "karaoke", "cover", "instrumental", "piano", "slowed", "reverb",
         "nightcore", "speed up", "sped up", "remix", "mashup", "fanmade",
+        "amv", "fan edit", "fan video", "edit audio", "audio edit", "live",
+        "concert", "acoustic", "version", "compilation", "playlist", "ost mix",
     }
-    blocked_channel_prefixes = ("resum", "senpai", "noticias", "news", "review", "reaction")
+    blocked_channel_prefixes = (
+        "resum", "senpai", "miko", "noticias", "news", "review", "reaction",
+        "anime clip", "anime moments",
+    )
     if any(term in text for term in blocked_terms) or any(
         channel_text.startswith(prefix) for prefix in blocked_channel_prefixes
     ):
@@ -119,6 +129,12 @@ def _youtube_music_score(title: str, channel: str, duration_ms: int | None) -> i
         return -100
 
     score = 0
+    query_tokens = {
+        token for token in _normalized_match_text(query).split()
+        if len(token) >= 3
+    }
+    searchable_tokens = set(text.split())
+    score += min(len(query_tokens & searchable_tokens), 4) * 12
     if "topic" in channel_text or "official" in channel_text:
         score += 30
     if any(term in text for term in ("official audio", "official music video", "audio")):
@@ -140,6 +156,8 @@ def _youtube_api_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
                 "part": "snippet",
                 "q": query,
                 "type": "video",
+                "videoCategoryId": "10",
+                "order": "relevance",
                 "maxResults": 25,
             },
             timeout=REQUEST_TIMEOUT_SECONDS,
@@ -190,7 +208,7 @@ def _youtube_api_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
         title = snippet.get("title") or "Sin título"
         channel = snippet.get("channelTitle") or "Canal desconocido"
         duration_ms = durations.get(video_id)
-        score = _youtube_music_score(title, channel, duration_ms)
+        score = _youtube_music_score(query, title, channel, duration_ms)
         if score < 0:
             continue
         tracks.append((score, {
@@ -867,7 +885,32 @@ def youtube_url(title: str = Query(...), artist: str = Query("")):
     if not results:
         raise HTTPException(status_code=404, detail="No se encontró un video musical")
 
-    selected = results[0]
+    selected = None
+    for candidate in results:
+        candidate_id = candidate.get("video_id") or ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate_id):
+            continue
+        try:
+            with yt_dlp.YoutubeDL({
+                "format": "bestaudio/best",
+                "noplaylist": True,
+                "quiet": True,
+                "skip_download": True,
+                **youtube_options(),
+            }) as ydl:
+                info = ydl.extract_info(
+                    f"https://www.youtube.com/watch?v={candidate_id}",
+                    download=False,
+                )
+            if info and info.get("id"):
+                selected = candidate
+                break
+        except Exception:
+            continue
+
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Ningún resultado se puede descargar")
+
     video_id = selected.get("video_id") or ""
     return {
         "title": selected.get("name"),
