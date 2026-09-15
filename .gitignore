@@ -16,7 +16,7 @@ __pycache__/
 
 .DS_Store
 
-uvicorn-restart*.log
+uvicorn*.log
 
 
 # Archivos de sesión privados
