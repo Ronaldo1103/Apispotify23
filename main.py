@@ -144,6 +144,37 @@ def _youtube_music_score(
     return score
 
 
+_TITLE_ALIASES = {
+    "the promise": ["ここにある約束"],
+    "if you were stand by me": ["あなたがそばにいてくれたら"],
+}
+
+
+def _youtube_metadata_queries(title: str, artist: str) -> list[str]:
+    normalized_title = _normalized_match_text(title)
+    clean_title = title.strip()
+    clean_artist = artist.strip()
+    title_variants = [*_TITLE_ALIASES.get(normalized_title, []), clean_title]
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    for title_variant in title_variants:
+        for parts in (
+            (title_variant, clean_artist),
+            (clean_artist, title_variant),
+            (title_variant, clean_artist, "official audio"),
+        ):
+            query = " ".join(part for part in parts if part).strip()
+            if query and query.lower() not in seen:
+                seen.add(query.lower())
+                queries.append(query)
+    return queries[:4]
+
+
+def _youtube_metadata_query(title: str, artist: str) -> str:
+    return _youtube_metadata_queries(title, artist)[0]
+
+
 def _youtube_api_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
     if not YOUTUBE_API_KEY:
         return []
@@ -875,13 +906,22 @@ def youtube_search(q: str = Query(..., description="Buscar metadatos de videos e
 
 @app.get("/youtube/url")
 def youtube_url(title: str = Query(...), artist: str = Query("")):
-    query = " ".join(part.strip() for part in (title, artist) if part.strip())
-    if not query:
+    queries = _youtube_metadata_queries(title, artist)
+    if not queries:
         raise HTTPException(status_code=400, detail="title no puede ir vacío")
     if not YOUTUBE_API_KEY:
         raise HTTPException(status_code=503, detail="YOUTUBE_API_KEY no está configurada")
 
-    results = _youtube_api_search(query, limit=5)
+    results: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for query in queries:
+        for result in _youtube_api_search(query, limit=5):
+            video_id = result.get("video_id") or ""
+            if video_id and video_id not in seen_ids:
+                seen_ids.add(video_id)
+                results.append(result)
+        if len(results) >= 5:
+            break
     if not results:
         raise HTTPException(status_code=404, detail="No se encontró un video musical")
 
