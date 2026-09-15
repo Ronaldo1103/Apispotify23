@@ -4,6 +4,7 @@ import html
 import json
 import os
 import re
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -175,22 +176,28 @@ def _youtube_metadata_query(title: str, artist: str) -> str:
     return _youtube_metadata_queries(title, artist)[0]
 
 
-def _youtube_api_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
+def _youtube_api_search(
+    query: str,
+    limit: int = 10,
+    music_category_only: bool = True,
+) -> list[dict[str, Any]]:
     if not YOUTUBE_API_KEY:
         return []
 
     try:
+        search_params = {
+            "key": YOUTUBE_API_KEY,
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "order": "relevance",
+            "maxResults": 25,
+        }
+        if music_category_only:
+            search_params["videoCategoryId"] = "10"
         search_response = requests.get(
             "https://www.googleapis.com/youtube/v3/search",
-            params={
-                "key": YOUTUBE_API_KEY,
-                "part": "snippet",
-                "q": query,
-                "type": "video",
-                "videoCategoryId": "10",
-                "order": "relevance",
-                "maxResults": 25,
-            },
+            params=search_params,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         search_response.raise_for_status()
@@ -259,7 +266,10 @@ def _youtube_api_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
             "raw": item,
         }))
     tracks.sort(key=lambda entry: entry[0], reverse=True)
-    return [track for _, track in tracks[: max(1, min(limit, 25))]]
+    output = [track for _, track in tracks[: max(1, min(limit, 25))]]
+    if not output and music_category_only:
+        return _youtube_api_search(query, limit, music_category_only=False)
+    return output
 
 
 def _itunes_search(query: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -842,6 +852,16 @@ def _spotify_track_matches_query(track: dict[str, Any], query: str) -> bool:
     return any(token in searchable_text.split() for token in query_tokens)
 
 
+def _spotify_search(query: str, limit: int) -> dict[str, Any] | None:
+    for attempt in range(2):
+        try:
+            return Song().query_songs(query, limit=limit)
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.2)
+    return None
+
+
 def _saavn_queries_from_spotify_track(track: dict[str, Any]) -> list[str]:
     name = (track.get("name") or "").strip()
     artists = track.get("artists") or []
@@ -876,8 +896,10 @@ def _spotify_tracks_for_query(query: str, limit: int = 5) -> list[dict[str, Any]
     if not q:
         return []
     try:
-        search = Song().query_songs(q, limit=limit)
+        search = _spotify_search(q, limit)
     except Exception:
+        return []
+    if search is None:
         return []
     tracks = [_extract_track_payload(item) for item in _extract_search_items(search, "tracksV2")]
     related_tracks = [track for track in tracks if _spotify_track_matches_query(track, q)]
@@ -1144,7 +1166,9 @@ def buscar(q: str = Query(..., description="Texto a buscar"), limit: int = 10):
     if not q:
         raise HTTPException(status_code=400, detail="q no puede ir vacío")
 
-    search = Song().query_songs(q, limit=limit)
+    search = _spotify_search(q, limit)
+    if search is None:
+        raise HTTPException(status_code=503, detail="Spotify no está disponible temporalmente")
     tracks = [_extract_track_payload(item) for item in _extract_search_items(search, "tracksV2")]
     artists = [_extract_artist_payload(item) for item in _extract_search_items(search, "artists")]
     albums = [_extract_album_payload(item) for item in _extract_search_items(search, "albums")]
@@ -1170,8 +1194,7 @@ def buscar_canciones(q: str = Query(...), limit: int = 10):
     if not q:
         raise HTTPException(status_code=400, detail="q no puede ir vacío")
 
-    search = Song().query_songs(q, limit=limit)
-    tracks = [_extract_track_payload(item) for item in _extract_search_items(search, "tracksV2")]
+    tracks = _spotify_tracks_for_query(q, limit=limit)
     if not tracks:
         tracks = _itunes_search(q, limit=limit)
     return {"query": q, "limit": limit, "results": {"tracks": tracks}}
@@ -1183,7 +1206,9 @@ def buscar_artistas(q: str = Query(...), limit: int = 10):
     if not q:
         raise HTTPException(status_code=400, detail="q no puede ir vacío")
 
-    search = Song().query_songs(q, limit=limit)
+    search = _spotify_search(q, limit)
+    if search is None:
+        raise HTTPException(status_code=503, detail="Spotify no está disponible temporalmente")
     artists = [_extract_artist_payload(item) for item in _extract_search_items(search, "artists")]
     return {"query": q, "limit": limit, "results": {"artists": artists}}
 
@@ -1194,7 +1219,9 @@ def buscar_albumes(q: str = Query(...), limit: int = 10):
     if not q:
         raise HTTPException(status_code=400, detail="q no puede ir vacío")
 
-    search = Song().query_songs(q, limit=limit)
+    search = _spotify_search(q, limit)
+    if search is None:
+        raise HTTPException(status_code=503, detail="Spotify no está disponible temporalmente")
     albums = [_extract_album_payload(item) for item in _extract_search_items(search, "albums")]
     return {"query": q, "limit": limit, "results": {"albums": albums}}
 
@@ -1205,7 +1232,9 @@ def buscar_playlists(q: str = Query(...), limit: int = 10):
     if not q:
         raise HTTPException(status_code=400, detail="q no puede ir vacío")
 
-    search = Song().query_songs(q, limit=limit)
+    search = _spotify_search(q, limit)
+    if search is None:
+        raise HTTPException(status_code=503, detail="Spotify no está disponible temporalmente")
     playlists = [_extract_playlist_payload(item) for item in _extract_search_items(search, "playlists")]
     return {"query": q, "limit": limit, "results": {"playlists": playlists}}
 
@@ -1216,7 +1245,9 @@ def buscar_todo(q: str = Query(...), limit: int = 10):
     if not q:
         raise HTTPException(status_code=400, detail="q no puede ir vacío")
 
-    search = Song().query_songs(q, limit=limit)
+    search = _spotify_search(q, limit)
+    if search is None:
+        raise HTTPException(status_code=503, detail="Spotify no está disponible temporalmente")
     tracks = [_extract_track_payload(item) for item in _extract_search_items(search, "tracksV2")]
     artists = [_extract_artist_payload(item) for item in _extract_search_items(search, "artists")]
     albums = [_extract_album_payload(item) for item in _extract_search_items(search, "albums")]
